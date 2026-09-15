@@ -57,6 +57,40 @@ Generate DACUM structure using AI
 - Body: `{ "prompt": "your prompt here" }`
 - Returns: Anthropic API response with generated DACUM
 
+### POST /api/module-mapping
+Used by Module Builder's Training Structure Mapping feature. Unlike
+`/api/generate-dacum`, this endpoint builds the prompt itself from
+structured data and returns a parsed JSON object directly — not
+Anthropic's raw response envelope.
+- Body:
+```json
+{
+  "module": { "moduleId": "...", "moduleNumber": "M1", "moduleTitle": "..." },
+  "learningOutcomes": [
+    { "id": "lo-1", "number": "LO1", "statement": "...",
+      "performanceCriteria": [ { "id": "1-1", "text": "...", "taskId": "..." } ] }
+  ],
+  "sourceTaskIds": ["..."],
+  "taskAnalysis": { "<taskId>": { "taskCode": "TASK B4", "requiredKnowledge": [...], "...": "..." } },
+  "language": "en"
+}
+```
+- Returns:
+```json
+{
+  "analysisSummary": "...",
+  "informationSheets": [ { "tempId": "is-1", "title": "...", "rationale": "...",
+      "learningOutcomeIds": [...], "performanceCriteriaIds": [...],
+      "sourceTaskIds": [...], "sourceFields": [...], "mappingType": "direct" } ],
+  "activitySheets": [ ... ],
+  "assessmentUnits": [ ... ],
+  "missingInformation": [ { "sourceTaskId": "...", "field": "safetyOSH", "message": "..." } ]
+}
+```
+- Errors: `400` missing/empty module or learning outcomes, `429` Anthropic
+  rate limit, `502` Anthropic server error or an unparseable AI reply,
+  `500` missing API key or unexpected server error.
+
 ## 🌐 Deploy to Render.com
 
 See DEPLOYMENT.md for detailed instructions.
