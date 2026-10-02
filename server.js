@@ -5,6 +5,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Model and output budget can be changed from the hosting dashboard
+// (Railway → Variables) without a code change. Defaults keep the exact
+// behaviour this server has always had.
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+const MODULE_MAPPING_MAX_TOKENS = parseInt(process.env.MODULE_MAPPING_MAX_TOKENS, 10) || 8000;
+
 // Middleware
 app.use(cors()); // Allow requests from any origin
 app.use(express.json({ limit: '10mb' }));
@@ -14,7 +20,7 @@ app.get('/', (req, res) => {
     res.json({ 
         status: 'ok', 
         message: 'DACUM AI Backend Server is running',
-        version: '1.0.0'
+        version: '1.1.0'
     });
 });
 
@@ -47,7 +53,7 @@ app.post('/api/generate-dacum', async (req, res) => {
                 'anthropic-version': '2023-06-01'
             },
             body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
+                model: ANTHROPIC_MODEL,
                 max_tokens: 4000,
                 messages: [
                     { role: 'user', content: prompt }
@@ -102,6 +108,31 @@ const MODULE_MAPPING_FIELD_LABELS = {
     commonErrorsTroubleshooting: 'Common Errors / Troubleshooting'
 };
 
+// ── Item lists, numbered exactly as Module Builder numbers them ──
+// Module Builder (src/module-ai.js, _mbGetFieldItems) resolves a
+// suggestion's source by { taskId, field, itemIndex }. The index is the
+// item's position AFTER empty entries are dropped: an array keeps its
+// non-blank entries, trimmed; a scalar field is one item. The prompt
+// must number items by the SAME rule, or every citation lands one item
+// off. This one function is used for both the prompt and validation.
+function fieldItems(val) {
+    if (Array.isArray(val)) return val.filter(v => v && String(v).trim()).map(v => String(v).trim());
+    if (val && String(val).trim()) return [String(val).trim()];
+    return [];
+}
+
+// Pseudo task id under which Module Builder offers the Verified
+// Occupational Reference Data (DACUM Live Pro → Module Builder 3.8).
+const OCC_REF_TASK = '__occref__';
+
+function refCategories(input) {
+    const ref = input && input.occupationalReference;
+    return (ref && Array.isArray(ref.categories)) ? ref.categories : [];
+}
+function refItems(cat) {
+    return fieldItems((cat && Array.isArray(cat.items) ? cat.items : []).map(i => (i && i.text) || ''));
+}
+
 // Renders exactly what was supplied and nothing else — an empty or
 // missing field for a task is simply absent from the prompt, which is
 // what stops the model treating silence as "nothing to report" and
@@ -109,27 +140,49 @@ const MODULE_MAPPING_FIELD_LABELS = {
 function buildModuleMappingPrompt(input) {
     const { module: mod, learningOutcomes, sourceTaskIds, taskAnalysis, language } = input;
 
+    // The id Module Builder resolves (lo-3) AND the number people read
+    // (LO3). The id used to be missing here, so the model could only
+    // answer with "LO3", which matches nothing on the client: every
+    // sheet then landed on the module's first outcome and every
+    // assessment suggestion was skipped.
     const loBlock = (learningOutcomes || []).map(lo => {
         const pcBlock = (lo.performanceCriteria || [])
-            .map(pc => `    - ${pc.id}: ${pc.text}${pc.taskId ? ` [source task: ${pc.taskId}]` : ''}`)
+            .map(pc => `    - [pc id: ${pc.id}] ${pc.text}${pc.taskId ? ` [source task: ${pc.taskId}]` : ''}`)
             .join('\n') || '    (no performance criteria recorded)';
-        return `- ${lo.number || lo.id}: ${lo.statement || '(no statement recorded)'}\n${pcBlock}`;
+        return `- [lo id: ${lo.id}] ${lo.number || ''}: ${lo.statement || '(no statement recorded)'}\n${pcBlock}`;
     }).join('\n');
 
     const taBlock = (sourceTaskIds || []).map(taskId => {
         const ta = (taskAnalysis || {})[taskId];
-        if (!ta) return `- ${taskId}: (no Task Analysis data available for this task)`;
+        if (!ta) return `- [task id: ${taskId}] (no Task Analysis data available for this task)`;
         const fields = Object.keys(MODULE_MAPPING_FIELD_LABELS)
             .map(key => {
-                const val = ta[key];
-                const items = Array.isArray(val) ? val.filter(Boolean) : (val && String(val).trim() ? [String(val).trim()] : []);
+                const items = fieldItems(ta[key]);
                 if (!items.length) return null;
-                return `    - ${MODULE_MAPPING_FIELD_LABELS[key]} [field: ${key}]: ${items.join(' | ')}`;
+                return `    - ${MODULE_MAPPING_FIELD_LABELS[key]} [field: ${key}]:\n` +
+                    items.map((t, i) => `        [${i}] ${t}`).join('\n');
             })
             .filter(Boolean)
             .join('\n');
-        return `- ${ta.taskCode || taskId}:\n${fields || '    (every Task Analysis field for this task is empty)'}`;
+        return `- [task id: ${taskId}] ${ta.taskCode || ''}:\n${fields || '    (every Task Analysis field for this task is empty)'}`;
     }).join('\n');
+
+    const refBlock = refCategories(input).map(cat => {
+        const items = refItems(cat);
+        if (!items.length) return null;
+        const pct = i => {
+            const raw = cat.items.filter(x => x && String(x.text || '').trim())[i];
+            return raw && raw.percentage != null ? ` (verified importance ${raw.percentage}%)` : '';
+        };
+        return `- ${cat.name || cat.id} [field: ${cat.id}]:\n` +
+            items.map((t, i) => `    [${i}] ${t}${pct(i)}`).join('\n');
+    }).filter(Boolean).join('\n');
+
+    const level = parseInt(mod && mod.level, 10);
+    const levelLine = Number.isInteger(level) && level > 0
+        ? `PROGRAMME LEVEL: ${level}${mod.track ? ` — SPECIALISATION: ${mod.track}` : ''}
+Pitch the depth of every sheet to this level: lower levels emphasise guided, routine performance and safe basic practice; higher levels emphasise diagnosis, decision-making, independent work and responsibility. Do not add content that belongs to a different level.`
+        : '';
 
     return `You are an instructional design assistant specializing in competency-based vocational education and training.
 
@@ -143,13 +196,18 @@ The output is a PROPOSED STRUCTURE for a human curriculum developer to review, e
 
 MODULE
 ${mod.moduleNumber || ''} ${mod.moduleTitle || '(untitled module)'}
+${levelLine}
 
 LEARNING OUTCOMES AND PERFORMANCE CRITERIA
 ${loBlock || '(none supplied)'}
 
-TASK ANALYSIS (only fields actually filled in are listed; a task with none listed has no Task Analysis data yet)
+TASK ANALYSIS (only fields actually filled in are listed; items are numbered [0], [1] … within each field; a task with none listed has no Task Analysis data yet)
 ${taBlock || '(no source tasks supplied)'}
-
+${refBlock ? `
+VERIFIED OCCUPATIONAL REFERENCE (task id: ${OCC_REF_TASK})
+Occupation-level evidence ranked by the DACUM verification panel. It is REFERENCE ONLY: use it to enrich sheet content and resources (e.g. a verified tool as a resource or an information-sheet topic) where it supports a Learning Outcome above. NEVER create a learning outcome or a performance criterion from it, and never let it outweigh the Learning Outcomes and Performance Criteria.
+${refBlock}
+` : ''}
 Respond in ${language === 'ar' ? 'Arabic' : language === 'fr' ? 'French' : 'English'}, matching the language the module content above is written in.
 
 Respond with ONLY a single valid JSON object — no markdown code fences, no commentary before or after it — matching exactly this shape:
@@ -158,18 +216,91 @@ Respond with ONLY a single valid JSON object — no markdown code fences, no com
   "analysisSummary": "one or two sentences describing the proposed structure and why",
   "informationSheets": [
     { "tempId": "is-1", "title": "...", "rationale": "...",
-      "learningOutcomeIds": ["<LO id from the data above>"],
-      "performanceCriteriaIds": ["<PC id, e.g. 1-1>"],
-      "sourceTaskIds": ["<task id from the data above>"],
-      "sourceFields": ["<field name from the Task Analysis field list, e.g. requiredKnowledge>"],
+      "learningOutcomeIds": ["<lo id, e.g. lo-1>"],
+      "performanceCriteriaIds": ["<pc id, e.g. 1-1>"],
+      "sourceSelections": [
+        { "taskId": "<task id>", "field": "<field name, e.g. requiredKnowledge>", "itemIndex": 0, "itemText": "<the item's text exactly as listed>" }
+      ],
       "mappingType": "direct" }
   ],
-  "activitySheets": [ { "tempId": "as-1", "title": "...", "rationale": "...", "learningOutcomeIds": [], "performanceCriteriaIds": [], "sourceTaskIds": [], "sourceFields": [], "mappingType": "direct" } ],
-  "assessmentUnits": [ { "tempId": "au-1", "title": "...", "rationale": "...", "learningOutcomeIds": [], "performanceCriteriaIds": [], "sourceTaskIds": [], "sourceFields": [], "mappingType": "direct" } ],
+  "activitySheets": [ { "tempId": "as-1", "title": "...", "rationale": "...", "learningOutcomeIds": [], "performanceCriteriaIds": [], "sourceSelections": [], "mappingType": "direct" } ],
+  "assessmentUnits": [ { "tempId": "au-1", "title": "...", "rationale": "...", "learningOutcomeIds": [], "performanceCriteriaIds": [], "sourceSelections": [], "mappingType": "direct" } ],
   "missingInformation": [ { "sourceTaskId": "...", "field": "safetyOSH", "message": "No safety information was provided for this task." } ]
 }
 
-Use "transformation" for mappingType only when you reworded/regrouped source material into a more pedagogically useful title; use "direct" when the sheet corresponds closely to the source as given. Every learningOutcomeIds/performanceCriteriaIds/sourceTaskIds value must be one of the ids that actually appears in the data above — never invent an id. Every assessmentUnits item's learningOutcomeIds must contain exactly the one Learning Outcome its performance criteria belong to. If a field you would normally expect (safety, standards, tools) is genuinely absent from the supplied Task Analysis, note it in missingInformation instead of guessing a value. Omit any of the four arrays' entries entirely rather than padding them — an empty array is a valid and expected answer when the data does not support that category.`;
+sourceSelections cite individual numbered items: taskId is a [task id] above${refBlock ? ` (or "${OCC_REF_TASK}" for the occupational reference, with field = its [field] value)` : ''}, field is the [field] name, itemIndex is the [n] number within that field, and itemText repeats that item's text. Use "transformation" for mappingType only when you reworded/regrouped source material into a more pedagogically useful title; use "direct" when the sheet corresponds closely to the source as given. Every learningOutcomeIds value must be an [lo id] above and every performanceCriteriaIds value a [pc id] above — never invent an id. Every assessmentUnits item's learningOutcomeIds must contain exactly the one Learning Outcome its performance criteria belong to. If a field you would normally expect (safety, standards, tools) is genuinely absent from the supplied Task Analysis, note it in missingInformation instead of guessing a value. Omit any of the four arrays' entries entirely rather than padding them — an empty array is a valid and expected answer when the data does not support that category.`;
+}
+
+/**
+ * Hold the model's answer to the data it was given, before it leaves the
+ * server. Module Builder already discards what it cannot use; this makes
+ * what it receives right in the first place:
+ *   • learningOutcomeIds: an "LO3" number is turned into its id (lo-3);
+ *     anything unknown is dropped;
+ *   • performanceCriteriaIds: only ids that exist;
+ *   • sourceSelections: only {taskId, field, itemIndex} that point at a
+ *     real item — and itemText is replaced by that item's REAL text, so
+ *     a misquoted index can never show the user words the source does
+ *     not contain;
+ *   • an assessment with no outcome but with criteria gets the outcome
+ *     those criteria belong to (the client needs exactly one).
+ */
+function normalizeMappingResult(parsed, input) {
+    const arr = v => Array.isArray(v) ? v : [];
+    const los = arr(input.learningOutcomes);
+    const loId = {};
+    const pcToLo = {};
+    los.forEach(lo => {
+        if (!lo || !lo.id) return;
+        loId[String(lo.id).toLowerCase()] = lo.id;
+        if (lo.number) loId[String(lo.number).toLowerCase().replace(/\s+/g, '')] = lo.id;
+        arr(lo.performanceCriteria).forEach(pc => { if (pc && pc.id) pcToLo[String(pc.id)] = lo.id; });
+    });
+    const tasks = new Set(arr(input.sourceTaskIds).map(String));
+    const itemsFor = (taskId, field) => {
+        if (taskId === OCC_REF_TASK) {
+            const cat = refCategories(input).find(c => String(c.id) === String(field));
+            return cat ? refItems(cat) : [];
+        }
+        if (!tasks.has(taskId) || !MODULE_MAPPING_FIELD_LABELS[field]) return [];
+        return fieldItems(((input.taskAnalysis || {})[taskId] || {})[field]);
+    };
+
+    const fixItem = (it, isAssessment) => {
+        if (!it || typeof it !== 'object') return null;
+        const lo = [...new Set(arr(it.learningOutcomeIds)
+            .map(v => loId[String(v).toLowerCase().replace(/\s+/g, '')])
+            .filter(Boolean))];
+        const pc = [...new Set(arr(it.performanceCriteriaIds).map(String).filter(id => pcToLo[id]))];
+        const seen = new Set();
+        const sel = arr(it.sourceSelections).map(s => {
+            if (!s) return null;
+            const taskId = String(s.taskId || ''), field = String(s.field || '');
+            const idx = Number.isInteger(s.itemIndex) ? s.itemIndex : parseInt(s.itemIndex, 10);
+            const items = itemsFor(taskId, field);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= items.length) return null;
+            const key = taskId + '|' + field + '|' + idx;
+            if (seen.has(key)) return null;
+            seen.add(key);
+            return { taskId, field, itemIndex: idx, itemText: items[idx] };
+        }).filter(Boolean);
+        if (isAssessment && !lo.length && pc.length) lo.push(pcToLo[pc[0]]);
+        return {
+            ...it,
+            learningOutcomeIds: isAssessment ? lo.slice(0, 1) : lo,
+            performanceCriteriaIds: pc,
+            sourceSelections: sel,
+            mappingType: it.mappingType === 'transformation' ? 'transformation' : 'direct'
+        };
+    };
+
+    return {
+        analysisSummary: typeof parsed.analysisSummary === 'string' ? parsed.analysisSummary : '',
+        informationSheets: arr(parsed.informationSheets).map(i => fixItem(i, false)).filter(Boolean),
+        activitySheets:    arr(parsed.activitySheets).map(i => fixItem(i, false)).filter(Boolean),
+        assessmentUnits:   arr(parsed.assessmentUnits).map(i => fixItem(i, true)).filter(Boolean),
+        missingInformation: arr(parsed.missingInformation).filter(m => m && typeof m === 'object')
+    };
 }
 
 /** Best-effort extraction of a JSON object from the model's text reply.
@@ -218,8 +349,11 @@ app.post('/api/module-mapping', async (req, res) => {
                 'anthropic-version': '2023-06-01'
             },
             body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 4000,
+                model: ANTHROPIC_MODEL,
+                // Raised from 4000: a module with several outcomes and a
+                // full Task Analysis plus occupational reference could be
+                // cut off mid-JSON, which surfaced as "invalid response".
+                max_tokens: MODULE_MAPPING_MAX_TOKENS,
                 messages: [
                     { role: 'user', content: prompt },
                     // Prefilling the assistant turn with the opening brace is
@@ -253,7 +387,7 @@ app.post('/api/module-mapping', async (req, res) => {
         }
 
         console.log('✅ Module mapping proposal generated');
-        res.json(parsed);
+        res.json(normalizeMappingResult(parsed, input));
 
     } catch (error) {
         console.error('❌ Server Error (module-mapping):', error);
@@ -264,10 +398,13 @@ app.post('/api/module-mapping', async (req, res) => {
     }
 });
 
-// Start server
-app.listen(PORT, () => {
+// Start server — only when run directly (npm start / node server.js),
+// so the prompt and validation functions can be loaded by a test.
+if (require.main === module) app.listen(PORT, () => {
     console.log(`🚀 DACUM AI Backend Server running on port ${PORT}`);
     console.log(`📍 Health check: http://localhost:${PORT}/`);
     console.log(`🤖 AI endpoint: http://localhost:${PORT}/api/generate-dacum`);
     console.log(`🧩 Module mapping endpoint: http://localhost:${PORT}/api/module-mapping`);
 });
+
+module.exports = { app, buildModuleMappingPrompt, normalizeMappingResult, fieldItems };

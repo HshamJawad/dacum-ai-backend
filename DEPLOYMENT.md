@@ -1,199 +1,136 @@
-# 🚀 Deploying DACUM AI Backend to Render.com
+# 🚀 Deploying the DACUM AI Backend on Railway
 
-## Step-by-Step Deployment Guide
+This server is hosted on **Railway** and is used by two tools:
 
-### STEP 1: Get Your Anthropic API Key
+| Tool | Endpoint |
+|---|---|
+| DACUM Live Pro (all AI buttons) | `POST /api/generate-dacum` |
+| Module Builder (Training Structure Mapping) | `POST /api/module-mapping` |
 
+Live URL used by both front ends:
+`https://dacum-ai-backend-production.up.railway.app`
+
+> If the public URL ever changes, update it in **both** front ends:
+> DACUM Live Pro (`BACKEND_URL` in the `*_ai.js` files) and Module Builder
+> (`MB_AI_BACKEND_BASE` in `src/module-ai.js`).
+
+---
+
+## Updating the server (the usual case)
+
+The Railway service is connected to this GitHub repository, so an update
+is just a commit:
+
+1. Replace the changed files in the repository (`server.js`,
+   `package.json`, `README.md` …) — on GitHub: **Add file → Upload
+   files**, then **Commit changes**.
+2. Railway detects the commit and redeploys automatically (about 1–3
+   minutes). Watch progress in the service's **Deployments** tab.
+3. Check the health endpoint (see *Testing* below) — the `version` it
+   reports should match `package.json`.
+
+If a deploy does not start on its own, open the service in Railway and
+trigger a redeploy of the latest commit from the **Deployments** tab.
+
+---
+
+## First-time setup (only if the service has to be recreated)
+
+### 1. Anthropic API key
 1. Go to https://console.anthropic.com/settings/keys
-2. Sign in or create account
-3. Click "Create Key"
-4. Give it a name (e.g., "DACUM Backend")
-5. **COPY THE KEY** - you won't see it again!
-   - Format: `sk-ant-api03-xxxxxxxxxxxxx`
+2. Create a key (e.g. "DACUM Backend") and **copy it** — it is shown once.
+
+### 2. Repository
+The repository must contain at least `server.js`, `package.json`,
+`.gitignore` (with `.env` in it) and `README.md`. Never commit a `.env`
+file or a key.
+
+### 3. Railway service
+1. In the Railway dashboard: **New Project → Deploy from GitHub repo**,
+   and pick this repository.
+2. Railway detects Node.js from `package.json` and runs `npm install`
+   then `npm start` (= `node server.js`). No build or start command needs
+   to be entered. Node 18 or newer is required (`engines` in
+   `package.json`); the server uses the built-in `fetch`.
+3. Railway sets `PORT` itself — the server reads it, so do not add it.
+4. In the service **Settings → Networking**, generate a public domain.
+   If it differs from the URL above, update both front ends (see note).
+
+### 4. Variables
+In the service's **Variables** tab:
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | **Yes** | — | Key used for every AI call |
+| `ANTHROPIC_MODEL` | No | `claude-sonnet-4-20250514` | Model for both endpoints |
+| `MODULE_MAPPING_MAX_TOKENS` | No | `8000` | Output budget for `/api/module-mapping` |
+
+Saving a variable redeploys the service.
+
+**Changing the model:** set `ANTHROPIC_MODEL` to another model id from
+Anthropic's documentation (https://docs.claude.com) — no code change is
+needed. If Anthropic retires the default model, the AI buttons start
+failing with a model error in the logs; setting this variable is the fix.
 
 ---
 
-### STEP 2: Push Code to GitHub
+## Testing
 
-1. **Create a new GitHub repository:**
-   - Go to https://github.com/new
-   - Repository name: `dacum-ai-backend`
-   - Make it Public or Private
-   - Click "Create repository"
+**Health check** — open in a browser:
+`https://dacum-ai-backend-production.up.railway.app/`
 
-2. **Upload your backend files:**
-   
-   **Option A: Using GitHub Web Interface (Easiest)**
-   - Click "uploading an existing file"
-   - Drag and drop these files:
-     - server.js
-     - package.json
-     - .gitignore
-     - .env.example
-     - README.md
-   - Click "Commit changes"
+```json
+{ "status": "ok", "message": "DACUM AI Backend Server is running", "version": "1.1.0" }
+```
 
-   **Option B: Using Git Command Line**
-   ```bash
-   cd /path/to/backend/folder
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git remote add origin https://github.com/YOUR-USERNAME/dacum-ai-backend.git
-   git push -u origin main
-   ```
+**DACUM endpoint** — in the browser console:
+```javascript
+fetch('https://dacum-ai-backend-production.up.railway.app/api/generate-dacum', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ prompt: 'List three duties of a computer maintenance technician.' })
+}).then(r => r.json()).then(console.log);
+```
+
+**Module Builder endpoint** — easiest from the tool itself: open a module
+imported from DACUM Live Pro, go to Training Structure Mapping and run the
+AI analysis. The proposal's items should show their sources (task items
+or the occupational reference), not "not linked yet".
 
 ---
 
-### STEP 3: Deploy on Render.com
+## ⚙️ Common issues
 
-1. **Go to Render Dashboard:**
-   - Visit https://dashboard.render.com/
-   - You should already be signed in
+| Symptom | Likely cause / fix |
+|---|---|
+| Every AI button fails, logs show `API key not configured on server` | `ANTHROPIC_API_KEY` missing — add it in **Variables** |
+| Logs show `401` / `invalid x-api-key` | Key revoked or mistyped — create a new one and replace the variable |
+| Logs show a model `not_found` / deprecated error | Set `ANTHROPIC_MODEL` to a current model id |
+| Front end reports rate limit (`429`) | Anthropic usage limit reached — wait, or raise the limit in the Anthropic console |
+| Module Builder: "AI returned an invalid response" on large modules | Raise `MODULE_MAPPING_MAX_TOKENS` (e.g. `12000`) |
+| Deploy fails | Open the failed deployment's **Build Logs**; usually a syntax error in an edited file or a Node version below 18 |
+| Front end cannot reach the server | Check the public domain in **Settings → Networking** matches the URL in both front ends |
 
-2. **Click "New +" button** (top right)
-   - Select **"Web Service"**
-
-3. **Connect GitHub Repository:**
-   - Click "Configure account" to connect GitHub
-   - Grant Render access to your repositories
-   - Find and select `dacum-ai-backend`
-   - Click "Connect"
-
-4. **Configure Web Service:**
-   
-   Fill in these settings:
-   
-   | Setting | Value |
-   |---------|-------|
-   | **Name** | `dacum-ai-backend` (or any name you like) |
-   | **Region** | Choose closest to you (e.g., Frankfurt, Singapore) |
-   | **Branch** | `main` |
-   | **Runtime** | `Node` |
-   | **Build Command** | `npm install` |
-   | **Start Command** | `npm start` |
-   | **Instance Type** | `Free` (or paid if you prefer) |
-
-5. **Add Environment Variables:**
-   
-   Scroll down to **"Environment Variables"** section:
-   
-   - Click "Add Environment Variable"
-   - **Key:** `ANTHROPIC_API_KEY`
-   - **Value:** Paste your API key (sk-ant-api03-xxxxx...)
-   - Click "Add"
-
-6. **Deploy:**
-   - Click **"Create Web Service"** button at bottom
-   - Wait 2-5 minutes for deployment
-   - Watch the logs - you should see:
-     ```
-     🚀 DACUM AI Backend Server running on port 10000
-     ```
+**Logs:** service → **Deployments** → select the active deployment →
+**View Logs**. The server logs each call (`📤 Sending …`, `✅ Received …`,
+`❌ …`).
 
 ---
 
-### STEP 4: Test Your Backend
+## 🔒 Security checklist
 
-Once deployed, Render will give you a URL like:
-`https://dacum-ai-backend-xxxx.onrender.com`
-
-**Test it:**
-
-1. **Health Check:**
-   - Visit: `https://your-backend-url.onrender.com/`
-   - You should see:
-     ```json
-     {
-       "status": "ok",
-       "message": "DACUM AI Backend Server is running",
-       "version": "1.0.0"
-     }
-     ```
-
-2. **Test AI Endpoint:**
-   Use this in your browser console or Postman:
-   ```javascript
-   fetch('https://your-backend-url.onrender.com/api/generate-dacum', {
-     method: 'POST',
-     headers: { 'Content-Type': 'application/json' },
-     body: JSON.stringify({
-       prompt: 'Generate a simple DACUM for a Chef'
-     })
-   })
-   .then(r => r.json())
-   .then(d => console.log(d));
-   ```
+- ✅ The API key lives only in Railway **Variables**, never in the code or the repository
+- ✅ `.gitignore` contains `.env`
+- ✅ Neither front end ever sees or sends the key
+- ⚠️ CORS currently allows every origin (`app.use(cors())`). To restrict it
+  to the two tools, replace that line with
+  `app.use(cors({ origin: ['https://hshamjawad.github.io'] }))`
+  (add any other domain the tools are served from).
 
 ---
 
-### STEP 5: Get Your Backend URL
+## 💰 Cost notes
 
-1. In Render dashboard, click on your service
-2. At the top, you'll see the URL:
-   ```
-   https://dacum-ai-backend-xxxx.onrender.com
-   ```
-3. **COPY THIS URL** - you'll need it for the frontend!
-
----
-
-## ⚙️ Common Issues & Solutions
-
-### Issue: "Build failed"
-**Solution:** Check the logs. Usually missing dependencies or wrong Node version.
-
-### Issue: "Application failed to respond"
-**Solution:** Check Environment Variables - make sure ANTHROPIC_API_KEY is set.
-
-### Issue: "API key not valid"
-**Solution:** Double-check your API key in Environment Variables section.
-
-### Issue: "Service sleeping" (Free tier)
-**Solution:** Free tier sleeps after 15min of inactivity. First request may take 30-60 seconds to wake up.
-
----
-
-## 🎯 Next Steps
-
-After deployment succeeds:
-1. ✅ Copy your backend URL
-2. ✅ Update frontend HTML to use this URL
-3. ✅ Test AI generation from frontend
-4. ✅ Deploy frontend (GitHub Pages, Netlify, or Render Static Site)
-
----
-
-## 📊 Monitoring
-
-- **View Logs:** Render Dashboard → Your Service → Logs tab
-- **View Metrics:** Render Dashboard → Your Service → Metrics tab
-- **Restart Service:** Render Dashboard → Your Service → Manual Deploy → "Clear build cache & deploy"
-
----
-
-## 💰 Pricing Notes
-
-**Free Tier:**
-- ✅ 750 hours/month free
-- ✅ Auto-sleeps after 15min inactivity
-- ✅ Perfect for testing and light use
-
-**If you need 24/7 availability:**
-- Upgrade to paid plan ($7/month)
-- No sleeping
-- Faster performance
-
----
-
-## 🔒 Security Checklist
-
-- ✅ Never commit .env file
-- ✅ API key stored as environment variable (not in code)
-- ✅ .gitignore includes .env
-- ✅ GitHub repository can be private
-- ✅ CORS configured (restrict to your domain in production)
-
----
-
-**Questions? Issues? Check the logs first, then refer to Render docs: https://render.com/docs**
+Railway bills the running service by usage according to your plan; check
+current pricing in the Railway dashboard. Anthropic bills each AI call
+separately by tokens — see https://docs.claude.com for model pricing.

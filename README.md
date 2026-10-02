@@ -60,36 +60,56 @@ Generate DACUM structure using AI
 ### POST /api/module-mapping
 Used by Module Builder's Training Structure Mapping feature. Unlike
 `/api/generate-dacum`, this endpoint builds the prompt itself from
-structured data and returns a parsed JSON object directly — not
+structured data and returns a parsed, **validated** JSON object — not
 Anthropic's raw response envelope.
 - Body:
 ```json
 {
-  "module": { "moduleId": "...", "moduleNumber": "M1", "moduleTitle": "..." },
+  "module": { "moduleId": "...", "moduleNumber": "M1", "moduleTitle": "...",
+              "level": 1, "track": "CMCN" },
   "learningOutcomes": [
     { "id": "lo-1", "number": "LO1", "statement": "...",
       "performanceCriteria": [ { "id": "1-1", "text": "...", "taskId": "..." } ] }
   ],
   "sourceTaskIds": ["..."],
   "taskAnalysis": { "<taskId>": { "taskCode": "TASK B4", "requiredKnowledge": [...], "...": "..." } },
+  "occupationalReference": { "categories": [ { "id": "toolsEquipment", "name": "...",
+      "items": [ { "text": "Multimeter", "percentage": 93.3 } ] } ] },
   "language": "en"
 }
 ```
+  `level`, `track` and `occupationalReference` are optional (Module
+  Builder 3.8+). The occupational reference is reference evidence only:
+  it may inform sheet content and resources, never new learning outcomes.
 - Returns:
 ```json
 {
   "analysisSummary": "...",
   "informationSheets": [ { "tempId": "is-1", "title": "...", "rationale": "...",
-      "learningOutcomeIds": [...], "performanceCriteriaIds": [...],
-      "sourceTaskIds": [...], "sourceFields": [...], "mappingType": "direct" } ],
+      "learningOutcomeIds": ["lo-1"], "performanceCriteriaIds": ["1-1"],
+      "sourceSelections": [ { "taskId": "<taskId | __occref__>", "field": "requiredKnowledge",
+                              "itemIndex": 0, "itemText": "..." } ],
+      "mappingType": "direct" } ],
   "activitySheets": [ ... ],
   "assessmentUnits": [ ... ],
   "missingInformation": [ { "sourceTaskId": "...", "field": "safetyOSH", "message": "..." } ]
 }
 ```
+  Before it is returned, the result is checked against the request
+  (`normalizeMappingResult`): outcome numbers such as `LO3` become their
+  ids, unknown outcome/criterion ids are dropped, each `sourceSelections`
+  entry must point at a real item (`itemIndex` counts non-empty items in
+  that field, the same way Module Builder counts them) and its `itemText`
+  is replaced by that item's real text.
 - Errors: `400` missing/empty module or learning outcomes, `429` Anthropic
   rate limit, `502` Anthropic server error or an unparseable AI reply,
   `500` missing API key or unexpected server error.
+
+### Optional environment variables
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Model used by both endpoints |
+| `MODULE_MAPPING_MAX_TOKENS` | `8000` | Output budget for `/api/module-mapping` |
 
 ## 🌐 Deploy to Render.com
 
