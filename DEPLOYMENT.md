@@ -62,15 +62,29 @@ In the service's **Variables** tab:
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | **Yes** | — | Key used for every AI call |
-| `ANTHROPIC_MODEL` | No | `claude-sonnet-4-20250514` | Model for both endpoints |
-| `MODULE_MAPPING_MAX_TOKENS` | No | `8000` | Output budget for `/api/module-mapping` |
+| `ANTHROPIC_MODEL` | No | `claude-sonnet-5-5` | Model for both endpoints |
+| `ANTHROPIC_EFFORT` | No | (Anthropic default) | `low`, `medium` or `high` — how much the model thinks; lower is faster and cheaper |
+| `DACUM_MAX_TOKENS` | No | `8000` | Output budget for `/api/generate-dacum` |
+| `MODULE_MAPPING_MAX_TOKENS` | No | `16000` | Output budget for `/api/module-mapping` |
+| `UPSTREAM_TIMEOUT_MS` | No | `150000` | Give up on Anthropic after this long (answers 504) |
+| `RATE_LIMIT_MAX` | No | `60` | Requests per IP per minute on the two AI endpoints; `0` turns it off |
+| `ALLOWED_ORIGINS` | No | (any origin) | Comma-separated origins allowed to call the AI endpoints, e.g. `https://hshamjawad.github.io`. Standalone HTML files opened from disk use the origin `null` — add it only if they must work |
+| `DEBUG_ERRORS` | No | off | `1` = include Anthropic's error text in replies (debugging only) |
 
 Saving a variable redeploys the service.
 
-**Changing the model:** set `ANTHROPIC_MODEL` to another model id from
-Anthropic's documentation (https://docs.claude.com) — no code change is
-needed. If Anthropic retires the default model, the AI buttons start
-failing with a model error in the logs; setting this variable is the fix.
+**The model.** `claude-sonnet-4-20250514`, this server's old default, was
+**retired by Anthropic on 15 June 2026** — every AI call to it fails. If a
+`ANTHROPIC_MODEL` variable on Railway still names it (or any other retired
+model), delete the variable or set it to a current model id from
+https://docs.claude.com/en/docs/about-claude/model-deprecations. The health
+check shows the model in use.
+
+**Moving to current models** (done in 1.2.0): they reject a conversation that
+ends with an assistant turn (the old "prefill" trick used for JSON), count the
+model's thinking inside `max_tokens`, and may start a reply with a thinking
+block. The server no longer prefills, has larger token budgets, and returns
+only the text blocks, so the front ends read the reply as before.
 
 ---
 
@@ -80,8 +94,9 @@ failing with a model error in the logs; setting this variable is the fix.
 `https://dacum-ai-backend-production.up.railway.app/`
 
 ```json
-{ "status": "ok", "message": "DACUM AI Backend Server is running", "version": "1.1.0" }
+{ "status": "ok", "message": "DACUM AI Backend Server is running", "version": "1.2.0", "model": "claude-sonnet-5-5", "aiConfigured": true }
 ```
+`aiConfigured: false` means `ANTHROPIC_API_KEY` is missing.
 
 **DACUM endpoint** — in the browser console:
 ```javascript
@@ -134,3 +149,10 @@ or the occupational reference), not "not linked yet".
 Railway bills the running service by usage according to your plan; check
 current pricing in the Railway dashboard. Anthropic bills each AI call
 separately by tokens — see https://docs.claude.com for model pricing.
+
+---
+
+## Tests
+
+`npm test` runs the server's tests with Anthropic stubbed — no key, no
+network. GitHub Actions runs them on every push.
