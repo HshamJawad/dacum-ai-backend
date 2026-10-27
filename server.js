@@ -1,38 +1,187 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const pkg = require('./package.json');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Model and output budget can be changed from the hosting dashboard
-// (Railway → Variables) without a code change. Defaults keep the exact
-// behaviour this server has always had.
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
-const MODULE_MAPPING_MAX_TOKENS = parseInt(process.env.MODULE_MAPPING_MAX_TOKENS, 10) || 8000;
+// ── Configuration ───────────────────────────────────────────
+// Everything below can be changed from the hosting dashboard
+// (Railway → Variables) without a code change.
+const intEnv = (name, fallback) => {
+    const n = parseInt(process.env[name], 10);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+// claude-sonnet-4-20250514, this server's old default, was retired by
+// Anthropic on 2026-06-15; every call to it now fails. Set ANTHROPIC_MODEL
+// only to pin a different model.
+const DEFAULT_MODEL = 'claude-sonnet-5-5';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+// Optional: low | medium | high. Left unset, Anthropic's own default applies.
+const ANTHROPIC_EFFORT = process.env.ANTHROPIC_EFFORT || '';
+// max_tokens covers the model's thinking AND its answer on current models,
+// so these are higher than the old 4000 / 8000.
+const DACUM_MAX_TOKENS = intEnv('DACUM_MAX_TOKENS', 8000) || 8000;
+const MODULE_MAPPING_MAX_TOKENS = intEnv('MODULE_MAPPING_MAX_TOKENS', 16000) || 16000;
+const UPSTREAM_TIMEOUT_MS = intEnv('UPSTREAM_TIMEOUT_MS', 150000) || 150000;
+const UPSTREAM_RETRIES = intEnv('UPSTREAM_RETRIES', 1);
+const RETRY_DELAY_MS = intEnv('RETRY_DELAY_MS', 1500);
+const MAX_PROMPT_CHARS = intEnv('MAX_PROMPT_CHARS', 300000) || 300000;
+// Per-IP limit on the two AI endpoints; RATE_LIMIT_MAX=0 turns it off.
+const RATE_LIMIT_MAX = intEnv('RATE_LIMIT_MAX', 60);
+const RATE_LIMIT_WINDOW_MS = intEnv('RATE_LIMIT_WINDOW_MS', 60000) || 60000;
+// Optional comma-separated list of origins allowed to call the AI
+// endpoints, e.g. https://hshamjawad.github.io. Unset = any origin (the
+// behaviour this server has always had).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const DEBUG_ERRORS = process.env.DEBUG_ERRORS === '1';
+
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+
+// Railway terminates TLS in front of the app: trust one proxy hop so
+// req.ip is the visitor, not the proxy.
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
 
 // Middleware
-app.use(cors()); // Allow requests from any origin
+app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+app.use(ALLOWED_ORIGINS.length
+    ? cors({ origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)) })
+    : cors());   // Allow requests from any origin
 app.use(express.json({ limit: '10mb' }));
+
+// When an allow-list is set, a browser call from any other origin is refused
+// outright (CORS alone only stops the browser from READING the reply).
+function originGuard(req, res, next) {
+    if (!ALLOWED_ORIGINS.length) return next();
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.includes(origin)) return next();
+    console.warn('⛔ Refused origin:', origin || '(none)');
+    return res.status(403).json({ error: 'Origin not allowed' });
+}
+
+// Small in-memory sliding-window limiter — one process, no extra package.
+function rateLimiter(max, windowMs) {
+    const hits = new Map();
+    const timer = setInterval(() => {
+        const cutoff = Date.now() - windowMs;
+        for (const [k, list] of hits) {
+            const keep = list.filter(t => t > cutoff);
+            if (keep.length) hits.set(k, keep); else hits.delete(k);
+        }
+    }, windowMs);
+    if (timer.unref) timer.unref();
+    return (req, res, next) => {
+        if (!max) return next();
+        const now = Date.now(), key = req.ip || 'unknown';
+        const list = (hits.get(key) || []).filter(t => t > now - windowMs);
+        if (list.length >= max) {
+            res.setHeader('Retry-After', String(Math.ceil(windowMs / 1000)));
+            return res.status(429).json({ error: 'Too many requests, please wait a moment and try again' });
+        }
+        list.push(now);
+        hits.set(key, list);
+        next();
+    };
+}
+const aiLimiter = rateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+
+// ── Calling Anthropic ───────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** One request to Anthropic with a timeout and a retry on overload /
+ *  network trouble. Resolves { status, text }; rejects with an error that
+ *  carries the HTTP status to answer the browser with. */
+async function callAnthropic(payload) {
+    const body = { model: ANTHROPIC_MODEL, ...payload };
+    if (ANTHROPIC_EFFORT) body.output_config = { effort: ANTHROPIC_EFFORT };
+    const attempts = 1 + UPSTREAM_RETRIES;
+    let lastError;
+    for (let i = 0; i < attempts; i++) {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), UPSTREAM_TIMEOUT_MS);
+        try {
+            const response = await fetch(ANTHROPIC_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': process.env.ANTHROPIC_API_KEY,
+                    'anthropic-version': '2023-06-01'
+                },
+                body: JSON.stringify(body),
+                signal: ctl.signal
+            });
+            const text = await response.text();
+            if ([502, 503, 504, 529].includes(response.status) && i < attempts - 1) {
+                console.warn('⚠️ Anthropic answered ' + response.status + ' — retrying');
+                lastError = null;
+                await sleep(RETRY_DELAY_MS);
+                continue;
+            }
+            return { status: response.status, text };
+        } catch (e) {
+            const timedOut = e && e.name === 'AbortError';
+            lastError = Object.assign(new Error(timedOut ? 'The AI service took too long to answer' : 'Could not reach the AI service'),
+                { httpStatus: timedOut ? 504 : 502 });
+            if (!timedOut && i < attempts - 1) { await sleep(RETRY_DELAY_MS); continue; }
+            throw lastError;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    throw lastError || Object.assign(new Error('Could not reach the AI service'), { httpStatus: 502 });
+}
+
+/** Answer the browser for a failed Anthropic call: the useful detail goes
+ *  to the log, a short generic message goes to the browser. */
+function sendUpstreamFailure(res, status, text) {
+    console.error('❌ Anthropic API Error (' + status + '):', String(text).slice(0, 2000));
+    if (status === 429) return res.status(429).json({ error: 'Anthropic API rate limit reached' });
+    const out = { error: status === 401 || status === 403 ? 'AI service is not configured correctly'
+        : status === 404 ? 'The configured AI model is unavailable'
+        : 'Anthropic API request failed' };
+    if (DEBUG_ERRORS) out.details = String(text).slice(0, 2000);
+    return res.status(502).json(out);
+}
+
+/** The text blocks of a reply. Current models can open a reply with a
+ *  thinking block, so content[0] is not always the text. */
+function textBlocks(data) {
+    return (data && Array.isArray(data.content) ? data.content : []).filter(b => b && b.type === 'text');
+}
+
+function internalError(res, scope, error) {
+    console.error('❌ Server Error (' + scope + '):', error);
+    const out = { error: 'Internal server error' };
+    if (DEBUG_ERRORS) out.message = error && error.message;
+    return res.status(500).json(out);
+}
 
 // Health check endpoint
 app.get('/', (req, res) => {
-    res.json({ 
-        status: 'ok', 
+    res.json({
+        status: 'ok',
         message: 'DACUM AI Backend Server is running',
-        version: '1.1.0'
+        version: pkg.version,
+        model: ANTHROPIC_MODEL,
+        aiConfigured: !!process.env.ANTHROPIC_API_KEY
     });
 });
 
 // AI Generation endpoint
-app.post('/api/generate-dacum', async (req, res) => {
+app.post('/api/generate-dacum', originGuard, aiLimiter, async (req, res) => {
     try {
-        const { prompt } = req.body;
+        const { prompt } = req.body || {};
 
         if (!prompt) {
             return res.status(400).json({ 
                 error: 'Prompt is required' 
             });
+        }
+        if (typeof prompt !== 'string' || prompt.length > MAX_PROMPT_CHARS) {
+            return res.status(400).json({ error: 'Prompt must be text of at most ' + MAX_PROMPT_CHARS + ' characters' });
         }
 
         // Check if API key is configured
@@ -44,44 +193,25 @@ app.post('/api/generate-dacum', async (req, res) => {
 
         console.log('📤 Sending request to Anthropic API...');
 
-        // Call Anthropic API
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': process.env.ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01'
-            },
-            body: JSON.stringify({
-                model: ANTHROPIC_MODEL,
-                max_tokens: 4000,
-                messages: [
-                    { role: 'user', content: prompt }
-                ]
-            })
+        const upstream = await callAnthropic({
+            max_tokens: DACUM_MAX_TOKENS,
+            messages: [{ role: 'user', content: prompt }]
         });
+        if (upstream.status < 200 || upstream.status >= 300) return sendUpstreamFailure(res, upstream.status, upstream.text);
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('❌ Anthropic API Error:', errorText);
-            return res.status(response.status).json({ 
-                error: 'Anthropic API request failed',
-                details: errorText
-            });
-        }
-
-        const data = await response.json();
+        let data;
+        try { data = JSON.parse(upstream.text); }
+        catch (_) { return res.status(502).json({ error: 'AI returned an invalid response' }); }
         console.log('✅ Received response from Anthropic API');
 
-        // Return the response to frontend
+        // Same envelope the front ends have always read (content[0].text),
+        // without any thinking blocks in front of the text.
+        if (Array.isArray(data.content)) data.content = textBlocks(data);
         res.json(data);
 
     } catch (error) {
-        console.error('❌ Server Error:', error);
-        res.status(500).json({ 
-            error: 'Internal server error',
-            message: error.message 
-        });
+        if (error && error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
+        internalError(res, 'generate-dacum', error);
     }
 });
 
@@ -304,8 +434,7 @@ function normalizeMappingResult(parsed, input) {
 }
 
 /** Best-effort extraction of a JSON object from the model's text reply.
- *  The assistant-prefill below makes a stray code fence unlikely, but
- *  this still strips one if the model adds it anyway, rather than
+ *  Strips a code fence, or a sentence around the object, rather than
  *  failing a request that actually contains a good answer. */
 function extractJsonObject(text) {
     const trimmed = String(text || '').trim();
@@ -322,7 +451,7 @@ function extractJsonObject(text) {
     return null;
 }
 
-app.post('/api/module-mapping', async (req, res) => {
+app.post('/api/module-mapping', originGuard, aiLimiter, async (req, res) => {
     try {
         const input = req.body;
 
@@ -332,57 +461,43 @@ app.post('/api/module-mapping', async (req, res) => {
         if (!Array.isArray(input.learningOutcomes) || input.learningOutcomes.length === 0) {
             return res.status(400).json({ error: 'At least one learning outcome is required' });
         }
+        if (input.learningOutcomes.length > 100 || (Array.isArray(input.sourceTaskIds) && input.sourceTaskIds.length > 500)) {
+            return res.status(400).json({ error: 'Too many learning outcomes or tasks in one request' });
+        }
 
         if (!process.env.ANTHROPIC_API_KEY) {
             return res.status(500).json({ error: 'API key not configured on server' });
         }
 
         const prompt = buildModuleMappingPrompt(input);
+        if (prompt.length > MAX_PROMPT_CHARS) {
+            return res.status(400).json({ error: 'The module is too large to analyse in one request' });
+        }
 
         console.log('📤 Sending module-mapping request to Anthropic API...');
 
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': process.env.ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01'
-            },
-            body: JSON.stringify({
-                model: ANTHROPIC_MODEL,
-                // Raised from 4000: a module with several outcomes and a
-                // full Task Analysis plus occupational reference could be
-                // cut off mid-JSON, which surfaced as "invalid response".
-                max_tokens: MODULE_MAPPING_MAX_TOKENS,
-                messages: [
-                    { role: 'user', content: prompt },
-                    // Prefilling the assistant turn with the opening brace is
-                    // Anthropic's own documented technique for steering a
-                    // reply straight into JSON, without needing tool-use for
-                    // what is otherwise a plain text completion.
-                    { role: 'assistant', content: '{' }
-                ]
-            })
+        // No assistant "prefill": current models reject a conversation that
+        // ends with an assistant turn. The prompt already asks for a single
+        // JSON object, and extractJsonObject() copes with a fence or a stray
+        // sentence around it.
+        const upstream = await callAnthropic({
+            // Raised from 4000: a module with several outcomes and a
+            // full Task Analysis plus occupational reference could be
+            // cut off mid-JSON, which surfaced as "invalid response".
+            max_tokens: MODULE_MAPPING_MAX_TOKENS,
+            messages: [{ role: 'user', content: prompt }]
         });
+        if (upstream.status < 200 || upstream.status >= 300) return sendUpstreamFailure(res, upstream.status, upstream.text);
 
-        if (response.status === 429) {
-            return res.status(429).json({ error: 'Anthropic API rate limit reached' });
-        }
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('❌ Anthropic API Error:', errorText);
-            return res.status(response.status >= 500 ? 502 : response.status).json({
-                error: 'Anthropic API request failed',
-                details: errorText
-            });
-        }
+        let data;
+        try { data = JSON.parse(upstream.text); }
+        catch (_) { return res.status(502).json({ error: 'AI returned an invalid response' }); }
 
-        const data = await response.json();
-        const rawText = '{' + (data.content && data.content[0] && data.content[0].text || '');
+        const rawText = textBlocks(data).map(b => b.text || '').join('');
         const parsed = extractJsonObject(rawText);
 
         if (!parsed) {
-            console.error('❌ Could not parse JSON from model response:', rawText.slice(0, 500));
+            console.error('❌ Could not parse JSON from model response (stop_reason: ' + data.stop_reason + '):', rawText.slice(0, 500));
             return res.status(502).json({ error: 'AI returned an invalid response' });
         }
 
@@ -390,21 +505,38 @@ app.post('/api/module-mapping', async (req, res) => {
         res.json(normalizeMappingResult(parsed, input));
 
     } catch (error) {
-        console.error('❌ Server Error (module-mapping):', error);
-        res.status(500).json({
-            error: 'Internal server error',
-            message: error.message
-        });
+        if (error && error.httpStatus) return res.status(error.httpStatus).json({ error: error.message });
+        internalError(res, 'module-mapping', error);
     }
+});
+
+// Anything else: JSON, like the rest of the API.
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+
+// Bad JSON bodies and oversized bodies answer as JSON too.
+app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request too large' });
+    if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) return res.status(400).json({ error: 'Invalid JSON' });
+    return internalError(res, 'request', err);
 });
 
 // Start server — only when run directly (npm start / node server.js),
 // so the prompt and validation functions can be loaded by a test.
-if (require.main === module) app.listen(PORT, () => {
-    console.log(`🚀 DACUM AI Backend Server running on port ${PORT}`);
-    console.log(`📍 Health check: http://localhost:${PORT}/`);
-    console.log(`🤖 AI endpoint: http://localhost:${PORT}/api/generate-dacum`);
-    console.log(`🧩 Module mapping endpoint: http://localhost:${PORT}/api/module-mapping`);
-});
+if (require.main === module) {
+    const server = app.listen(PORT, () => {
+        console.log(`🚀 DACUM AI Backend Server ${pkg.version} running on port ${PORT}`);
+        console.log(`📍 Health check: http://localhost:${PORT}/`);
+        console.log(`🤖 AI endpoint: http://localhost:${PORT}/api/generate-dacum`);
+        console.log(`🧩 Module mapping endpoint: http://localhost:${PORT}/api/module-mapping`);
+        console.log(`🧠 Model: ${ANTHROPIC_MODEL}${process.env.ANTHROPIC_API_KEY ? '' : '  ⚠️ ANTHROPIC_API_KEY is not set'}`);
+    });
+    // Railway sends SIGTERM when it redeploys: finish the requests in flight.
+    process.on('SIGTERM', () => {
+        console.log('SIGTERM received — shutting down');
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 10000).unref();
+    });
+    process.on('unhandledRejection', reason => console.error('❌ Unhandled rejection:', reason));
+}
 
-module.exports = { app, buildModuleMappingPrompt, normalizeMappingResult, fieldItems };
+module.exports = { app, buildModuleMappingPrompt, normalizeMappingResult, fieldItems, extractJsonObject, textBlocks, DEFAULT_MODEL };

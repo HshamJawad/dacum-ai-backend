@@ -50,7 +50,7 @@ curl -X POST http://localhost:3000/api/generate-dacum \
 
 ### GET /
 Health check endpoint
-- Returns: `{ status: 'ok', message: '...', version: '1.0.0' }`
+- Returns: `{ status: 'ok', message: '...', version, model, aiConfigured }`
 
 ### POST /api/generate-dacum
 Generate DACUM structure using AI
