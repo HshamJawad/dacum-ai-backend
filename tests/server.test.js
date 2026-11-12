@@ -42,6 +42,22 @@ test('health check reports version, model and whether the key is set', async () 
   assert.match(j.version, /^\d+\.\d+\.\d+$/);
 });
 
+test('/health is 200 with the key set and 503 without it, and never calls Anthropic', async () => {
+  const r = await realFetch(base + '/health');
+  assert.strictEqual(r.status, 200);
+  const j = await r.json();
+  assert.strictEqual(j.status, 'ok'); assert.strictEqual(j.service, 'dacum-ai-backend');
+  assert.strictEqual(j.aiConfigured, true); assert.match(j.version, /^\d+\.\d+\.\d+$/);
+  assert.strictEqual(upstreamCalls.length, 0);
+  const key = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  try {
+    const d = await realFetch(base + '/health');
+    assert.strictEqual(d.status, 503);
+    assert.strictEqual((await d.json()).status, 'degraded');
+  } finally { process.env.ANTHROPIC_API_KEY = key; }
+});
+
 test('the default model is not the retired claude-sonnet-4-20250514', () => {
   assert.strictEqual(DEFAULT_MODEL, 'claude-sonnet-5-5');
 });

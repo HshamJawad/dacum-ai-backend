@@ -1,6 +1,6 @@
 {
   "name": "dacum-ai-backend",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Backend server for DACUM Chart Generator AI features",
   "main": "server.js",
   "scripts": {

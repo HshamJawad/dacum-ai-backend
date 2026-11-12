@@ -34,6 +34,16 @@ trigger a redeploy of the latest commit from the **Deployments** tab.
 
 ---
 
+## Monitoring
+
+`GET /health` is for uptime monitors. It answers `200` with
+`{"status":"ok", ...}` when the server runs and `ANTHROPIC_API_KEY` is set, and
+`503` with `"status":"degraded"` when the key is missing. It never calls
+Anthropic, is not rate limited and shows no secrets. Point the monitor at
+`https://dacum-ai-backend-production.up.railway.app/health`.
+
+---
+
 ## First-time setup (only if the service has to be recreated)
 
 ### 1. Anthropic API key
