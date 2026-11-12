@@ -24,5 +24,6 @@ test('the fourth call in a minute gets 429 with Retry-After; the health check is
   assert.ok(r.headers.get('retry-after'));
   assert.match((await r.json()).error, /Too many requests/);
   for (let i = 0; i < 5; i++) assert.strictEqual((await realFetch(base + '/')).status, 200);
+  for (let i = 0; i < 5; i++) assert.strictEqual((await realFetch(base + '/health')).status, 200);
   server.close();
 });

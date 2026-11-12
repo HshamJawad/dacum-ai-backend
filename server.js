@@ -170,6 +170,21 @@ app.get('/', (req, res) => {
     });
 });
 
+// Monitoring endpoint for uptime checkers (UptimeRobot, Better Stack, ...).
+// Cheap, never calls Anthropic, is not rate limited and exposes no secrets.
+// 200 = running and the AI key is set; 503 = running but the key is missing,
+// so a monitor alerts on a broken configuration as well as on an outage.
+app.get('/health', (req, res) => {
+    const aiConfigured = !!process.env.ANTHROPIC_API_KEY;
+    res.status(aiConfigured ? 200 : 503).json({
+        status: aiConfigured ? 'ok' : 'degraded',
+        service: 'dacum-ai-backend',
+        version: pkg.version,
+        aiConfigured,
+        uptimeSeconds: Math.round(process.uptime())
+    });
+});
+
 // AI Generation endpoint
 app.post('/api/generate-dacum', originGuard, aiLimiter, async (req, res) => {
     try {
